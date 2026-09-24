@@ -1,0 +1,1025 @@
+// ==================================================================
+// AN/PRC-1 PORTABLE WRIST-MOUNTED TRANSCEIVER V.0.1
+// ==================================================================
+#include <Arduino.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <RF24.h>
+
+// ============================================================
+// DEVICE SETTINGS
+// ============================================================
+
+// CHANGE THESE ON EACH ESP32
+
+const byte DEVICE_ID = 1;
+const char DEVICE_NAME[] = "ALPHA";
+
+// Other known devices.
+// Both ESP32s know about each other.
+// This will become automatic discovery in Version 2.
+
+struct Device {
+  byte id;
+  const char* name;
+};
+
+Device devices[] = {
+  {1, "ALPHA"},
+  {2, "BRAVO"},
+  {3, "CHARLIE"}
+};
+
+const byte DEVICE_COUNT = sizeof(devices) / sizeof(devices[0]);
+
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+
+// nRF24
+#define NRF_CE   4
+#define NRF_CSN  5
+
+// I2C
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+// Buttons
+#define BTN_UP       13
+#define BTN_DOWN     14
+#define BTN_SELECT   25
+#define BTN_BACK     26
+#define BTN_DOT      27
+#define BTN_DASH     33
+
+// Outputs
+#define LED_PIN      15
+#define BUZZER_PIN   17
+
+// ============================================================
+// LCD + RADIO
+// ============================================================
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+RF24 radio(NRF_CE, NRF_CSN);
+
+// ============================================================
+// RADIO ADDRESSES
+// ============================================================
+
+// Each device gets its own receiving address.
+//
+// nRF24 addresses must be 5 bytes.
+
+const byte addressALPHA[6] = "A0001";
+const byte addressBRAVO[6] = "B0002";
+const byte addressCHARLIE[6] = "C0003";
+
+// ============================================================
+// BUTTON STATES
+// ============================================================
+
+bool lastUp = HIGH;
+bool lastDown = HIGH;
+bool lastSelect = HIGH;
+bool lastBack = HIGH;
+bool lastDot = HIGH;
+bool lastDash = HIGH;
+
+// ============================================================
+// SCREENS
+// ============================================================
+
+enum Screen {
+  HOME,
+  TARGET_SELECT,
+  MESSAGE
+};
+
+Screen currentScreen = HOME;
+
+// ============================================================
+// TARGET
+// ============================================================
+
+byte selectedTarget = 2;
+
+// ============================================================
+// MORSE INPUT
+// ============================================================
+
+String currentMorse = "";
+String currentMessage = "";
+
+unsigned long lastMorseInput = 0;
+
+const unsigned long AUTO_LETTER_TIME = 500;
+
+// ============================================================
+// MESSAGE PACKET
+// ============================================================
+
+struct MessagePacket {
+  byte senderID;
+  byte receiverID;
+  char message[64];
+};
+
+// ============================================================
+// DEVICE ADDRESS
+// ============================================================
+
+const byte* getAddress(byte id) {
+
+  switch (id) {
+
+    case 1:
+      return addressALPHA;
+
+    case 2:
+      return addressBRAVO;
+
+    case 3:
+      return addressCHARLIE;
+
+    default:
+      return addressALPHA;
+  }
+}
+
+// ============================================================
+// FIND DEVICE NAME
+// ============================================================
+
+const char* getDeviceName(byte id) {
+
+  for (byte i = 0; i < DEVICE_COUNT; i++) {
+
+    if (devices[i].id == id) {
+      return devices[i].name;
+    }
+  }
+
+  return "UNKNOWN";
+}
+
+// ============================================================
+// BUZZER
+// ============================================================
+
+void beep(unsigned int duration) {
+
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  delay(duration);
+
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ============================================================
+// LED FLASH
+// ============================================================
+
+void flashLED(byte times = 1) {
+
+  for (byte i = 0; i < times; i++) {
+
+    digitalWrite(LED_PIN, HIGH);
+    delay(80);
+
+    digitalWrite(LED_PIN, LOW);
+    delay(80);
+  }
+}
+
+// ============================================================
+// MORSE TABLE
+// ============================================================
+
+const char* morseLetters[] = {
+
+  ".-", "-...", "-.-.", "-..", ".",
+  "..-.", "--.", "....", "..", ".---",
+  "-.-", ".-..", "--", "-.", "---",
+  ".--.", "--.-", ".-.", "...", "-",
+  "..-", "...-", ".--", "-..-",
+  "-.--", "--.."
+};
+
+const char letters[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+// ============================================================
+// NUMBERS
+// ============================================================
+
+const char* morseNumbers[] = {
+
+  "-----",
+  ".----",
+  "..---",
+  "...--",
+  "....-",
+  ".....",
+  "-....",
+  "--...",
+  "---..",
+  "----."
+};
+
+// ============================================================
+// MORSE → CHARACTER
+// ============================================================
+
+char morseToChar(String code) {
+
+  // Letters
+
+  for (byte i = 0; i < 26; i++) {
+
+    if (code == morseLetters[i]) {
+      return letters[i];
+    }
+  }
+
+  // Numbers
+
+  for (byte i = 0; i < 10; i++) {
+
+    if (code == morseNumbers[i]) {
+      return '0' + i;
+    }
+  }
+
+  // Space
+
+  if (code == "/") {
+    return ' ';
+  }
+
+  return '?';
+}
+
+// ============================================================
+// ADD CURRENT MORSE LETTER
+// ============================================================
+
+void commitMorse() {
+
+  if (currentMorse.length() == 0) {
+    return;
+  }
+
+  char decoded = morseToChar(currentMorse);
+
+  currentMessage += decoded;
+
+  currentMorse = "";
+
+  lastMorseInput = millis();
+
+  beep(60);
+
+  displayMessage();
+}
+
+// ============================================================
+// DISPLAY HOME
+// ============================================================
+
+void displayHome() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("MORSE LINK");
+
+  lcd.setCursor(0, 1);
+  lcd.print("SELECT: START");
+}
+
+// ============================================================
+// DISPLAY TARGET
+// ============================================================
+
+void displayTarget() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("SEND TO:");
+
+  lcd.setCursor(0, 1);
+  lcd.print("> ");
+  lcd.print(getDeviceName(selectedTarget));
+}
+
+// ============================================================
+// DISPLAY MESSAGE
+// ============================================================
+
+void displayMessage() {
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("TO:");
+  lcd.print(getDeviceName(selectedTarget));
+
+  lcd.setCursor(0, 1);
+
+  // Display the most recent portion
+  // if message gets longer than 16 characters.
+
+  String displayText = currentMessage;
+
+  if (currentMorse.length() > 0) {
+
+    displayText += currentMorse;
+  }
+
+  if (displayText.length() > 16) {
+
+    displayText =
+      displayText.substring(displayText.length() - 16);
+  }
+
+  lcd.print(displayText);
+}
+
+// ============================================================
+// RADIO SETUP
+// ============================================================
+
+void setupRadio() {
+
+  if (!radio.begin()) {
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("RADIO ERROR");
+
+    lcd.setCursor(0, 1);
+    lcd.print("CHECK NRF24");
+
+    while (true) {
+
+      digitalWrite(LED_PIN, HIGH);
+      delay(250);
+
+      digitalWrite(LED_PIN, LOW);
+      delay(250);
+    }
+  }
+
+  radio.setPALevel(RF24_PA_LOW);
+
+  radio.setDataRate(RF24_250KBPS);
+
+  radio.setChannel(108);
+
+  radio.setRetries(5, 15);
+
+  radio.setAutoAck(true);
+
+  // This device's receiving address
+
+  radio.openReadingPipe(
+    1,
+    getAddress(DEVICE_ID)
+  );
+
+  radio.startListening();
+}
+
+// ============================================================
+// SEND MESSAGE
+// ============================================================
+
+bool sendMessage() {
+
+  if (currentMessage.length() == 0) {
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("EMPTY MESSAGE");
+
+    beep(150);
+
+    delay(1000);
+
+    displayMessage();
+
+    return false;
+  }
+
+  // Finish any unfinished Morse character.
+
+  if (currentMorse.length() > 0) {
+    commitMorse();
+  }
+
+  MessagePacket packet;
+
+  packet.senderID = DEVICE_ID;
+  packet.receiverID = selectedTarget;
+
+  memset(packet.message, 0, sizeof(packet.message));
+
+  currentMessage.toCharArray(
+    packet.message,
+    sizeof(packet.message)
+  );
+
+  // Stop listening before transmitting.
+
+  radio.stopListening();
+
+  radio.openWritingPipe(
+    getAddress(selectedTarget)
+  );
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("SENDING TO:");
+
+  lcd.setCursor(0, 1);
+  lcd.print(getDeviceName(selectedTarget));
+
+  flashLED(1);
+
+  bool success = radio.write(
+    &packet,
+    sizeof(packet)
+  );
+
+  // Return to receiving mode.
+
+  radio.openReadingPipe(
+    1,
+    getAddress(DEVICE_ID)
+  );
+
+  radio.startListening();
+
+  delay(500);
+
+  lcd.clear();
+
+  if (success) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("MESSAGE SENT!");
+
+    lcd.setCursor(0, 1);
+    lcd.print(getDeviceName(selectedTarget));
+
+    beep(80);
+    delay(100);
+    beep(80);
+
+  } else {
+
+    lcd.setCursor(0, 0);
+    lcd.print("SEND FAILED");
+
+    lcd.setCursor(0, 1);
+    lcd.print("NO RESPONSE");
+
+    beep(300);
+  }
+
+  delay(1500);
+
+  currentMessage = "";
+  currentMorse = "";
+
+  displayHome();
+
+  return success;
+}
+
+// ============================================================
+// CHECK FOR RECEIVED MESSAGE
+// ============================================================
+
+void checkRadio() {
+
+  if (!radio.available()) {
+    return;
+  }
+
+  MessagePacket packet;
+
+  radio.read(
+    &packet,
+    sizeof(packet)
+  );
+
+  // Make absolutely sure the message
+  // is actually intended for us.
+
+  if (packet.receiverID != DEVICE_ID) {
+
+    return;
+  }
+
+  // Don't accept our own messages.
+
+  if (packet.senderID == DEVICE_ID) {
+
+    return;
+  }
+
+  // Flash LED and beep.
+
+  flashLED(3);
+
+  beep(100);
+  delay(100);
+  beep(100);
+  delay(100);
+  beep(200);
+
+  // Display sender.
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print("FROM:");
+  lcd.print(getDeviceName(packet.senderID));
+
+  lcd.setCursor(0, 1);
+
+  String incoming = String(packet.message);
+
+  if (incoming.length() > 16) {
+
+    incoming =
+      incoming.substring(0, 16);
+  }
+
+  lcd.print(incoming);
+
+  // Wait for the user to press SELECT.
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 5000) {
+
+    if (digitalRead(BTN_SELECT) == LOW) {
+
+      delay(200);
+
+      break;
+    }
+
+    delay(10);
+  }
+
+  displayHome();
+}
+
+// ============================================================
+// NEXT TARGET
+// ============================================================
+
+void nextTarget() {
+
+  byte index = 0;
+
+  for (byte i = 0; i < DEVICE_COUNT; i++) {
+
+    if (devices[i].id == selectedTarget) {
+      index = i;
+      break;
+    }
+  }
+
+  for (byte attempt = 0; attempt < DEVICE_COUNT; attempt++) {
+
+    index++;
+
+    if (index >= DEVICE_COUNT) {
+      index = 0;
+    }
+
+    // Don't select ourselves.
+
+    if (devices[index].id != DEVICE_ID) {
+
+      selectedTarget =
+        devices[index].id;
+
+      break;
+    }
+  }
+
+  displayTarget();
+
+  beep(40);
+}
+
+// ============================================================
+// PREVIOUS TARGET
+// ============================================================
+
+void previousTarget() {
+
+  int index = 0;
+
+  for (byte i = 0; i < DEVICE_COUNT; i++) {
+
+    if (devices[i].id == selectedTarget) {
+      index = i;
+      break;
+    }
+  }
+
+  for (byte attempt = 0; attempt < DEVICE_COUNT; attempt++) {
+
+    index--;
+
+    if (index < 0) {
+      index = DEVICE_COUNT - 1;
+    }
+
+    if (devices[index].id != DEVICE_ID) {
+
+      selectedTarget =
+        devices[index].id;
+
+      break;
+    }
+  }
+
+  displayTarget();
+
+  beep(40);
+}
+
+// ============================================================
+// BUTTON EDGE DETECTION
+// ============================================================
+
+bool pressed(
+  byte pin,
+  bool &lastState
+) {
+
+  bool state = digitalRead(pin);
+
+  bool result =
+    (state == LOW && lastState == HIGH);
+
+  lastState = state;
+
+  if (result) {
+
+    delay(25);
+  }
+
+  return result;
+}
+
+// ============================================================
+// SELECT BUTTON
+// ============================================================
+
+void handleSelect() {
+
+  static unsigned long pressStart = 0;
+
+  bool state = digitalRead(BTN_SELECT);
+
+  // Button pressed
+
+  if (state == LOW && lastSelect == HIGH) {
+
+    pressStart = millis();
+  }
+
+  // Button released
+
+  if (state == HIGH && lastSelect == LOW) {
+
+    unsigned long duration =
+      millis() - pressStart;
+
+    // MESSAGE SCREEN
+
+    if (currentScreen == MESSAGE) {
+
+      // Long press = SEND
+
+      if (duration >= 1000) {
+
+        sendMessage();
+
+      }
+
+      // Short press = finish Morse character
+
+      else {
+
+        commitMorse();
+      }
+    }
+
+    // TARGET SCREEN
+
+    else if (currentScreen == TARGET_SELECT) {
+
+      currentScreen = MESSAGE;
+
+      currentMessage = "";
+      currentMorse = "";
+
+      displayMessage();
+
+      beep(80);
+    }
+
+    // HOME SCREEN
+
+    else if (currentScreen == HOME) {
+
+      currentScreen = TARGET_SELECT;
+
+      displayTarget();
+
+      beep(80);
+    }
+  }
+
+  lastSelect = state;
+}
+
+// ============================================================
+// MESSAGE BUTTONS
+// ============================================================
+
+void handleMessageButtons() {
+
+  if (currentScreen != MESSAGE) {
+    return;
+  }
+
+  // DOT
+
+  if (pressed(BTN_DOT, lastDot)) {
+
+    currentMorse += ".";
+
+    lastMorseInput = millis();
+
+    beep(60);
+
+    displayMessage();
+  }
+
+  // DASH
+
+  if (pressed(BTN_DASH, lastDash)) {
+
+    currentMorse += "-";
+
+    lastMorseInput = millis();
+
+    beep(180);
+
+    displayMessage();
+  }
+
+  // BACK
+
+  if (pressed(BTN_BACK, lastBack)) {
+
+    // First remove current Morse input.
+
+    if (currentMorse.length() > 0) {
+
+      currentMorse.remove(
+        currentMorse.length() - 1
+      );
+
+    }
+
+    // Otherwise delete the last
+    // completed character.
+
+    else if (currentMessage.length() > 0) {
+
+      currentMessage.remove(
+        currentMessage.length() - 1
+      );
+    }
+
+    beep(40);
+
+    displayMessage();
+  }
+}
+
+// ============================================================
+// HOME/TARGET BUTTONS
+// ============================================================
+
+void handleNavigationButtons() {
+
+  if (currentScreen == HOME) {
+
+    return;
+  }
+
+  if (currentScreen == TARGET_SELECT) {
+
+    if (pressed(BTN_UP, lastUp)) {
+
+      previousTarget();
+    }
+
+    if (pressed(BTN_DOWN, lastDown)) {
+
+      nextTarget();
+    }
+
+    if (pressed(BTN_BACK, lastBack)) {
+
+      currentScreen = HOME;
+
+      displayHome();
+
+      beep(40);
+    }
+  }
+
+  else if (currentScreen == MESSAGE) {
+
+    // BACK
+
+    // handled by handleMessageButtons()
+
+  }
+}
+
+// ============================================================
+// AUTOMATIC MORSE LETTER
+// ============================================================
+
+void automaticMorseCommit() {
+
+  if (currentScreen != MESSAGE) {
+    return;
+  }
+
+  if (currentMorse.length() == 0) {
+    return;
+  }
+
+  if (
+    millis() - lastMorseInput
+    >= AUTO_LETTER_TIME
+  ) {
+
+    commitMorse();
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // I2C
+
+  Wire.begin(
+    SDA_PIN,
+    SCL_PIN
+  );
+
+  // Buttons
+
+  pinMode(
+    BTN_UP,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    BTN_DOWN,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    BTN_SELECT,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    BTN_BACK,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    BTN_DOT,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    BTN_DASH,
+    INPUT_PULLUP
+  );
+
+  // Outputs
+
+  pinMode(
+    LED_PIN,
+    OUTPUT
+  );
+
+  pinMode(
+    BUZZER_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    LED_PIN,
+    LOW
+  );
+
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
+
+  // LCD
+
+  lcd.init();
+
+  lcd.backlight();
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("MORSE LINK");
+
+  lcd.setCursor(0, 1);
+  lcd.print(DEVICE_NAME);
+
+  delay(1000);
+
+  // Radio
+
+  setupRadio();
+
+  delay(500);
+
+  displayHome();
+
+  Serial.println();
+  Serial.println("MORSE LINK");
+  Serial.print("Device: ");
+  Serial.println(DEVICE_NAME);
+  Serial.print("ID: ");
+  Serial.println(DEVICE_ID);
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+
+void loop() {
+
+  // Always check the radio.
+
+  checkRadio();
+
+  // SELECT has special handling
+  // because it supports short/long press.
+
+  handleSelect();
+
+  // Navigation
+
+  handleNavigationButtons();
+
+  // Morse input
+
+  handleMessageButtons();
+
+  // Automatically finish a Morse
+  // character after 500 ms.
+
+  automaticMorseCommit();
+
+  delay(5);
+}
